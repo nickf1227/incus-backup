@@ -10,9 +10,11 @@ from datetime import datetime, timedelta
 # Configuration Variables
 # ==========================
 DEBUG = True                               # Enable/disable debug output.
-RETENTION_DAYS = 7                         # Number of days to retain snapshots (older snapshots will be pruned).
-BACKUP_DIR = "/mnt/ice/incus-vms/"         # Directory to store the exported backup files.
+RETENTION_DAYS = 7                         # Days to retain snapshots
+BACKUP_RETENTION_DAYS = 14                 # Days to retain backup files
+BACKUP_DIR = "/mnt/ice/incus-vms/"         # Directory for exported backups
 LOG_FILE = "/var/log/incus-backup-nickf.log" # Log file path
+STATEFUL_SNAPSHOTS = False                  # Create snapshots with running state, including process memory state, TCP connections, etc
 # ==========================
 
 # Set up logging
@@ -100,52 +102,73 @@ def parse_iso_datetime(datetime_str):
         return datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%SZ")
 
 def prune_old_snapshots(vm_name, retention_days):
-    # ... [existing code] ...
-    for snap in snapshots:
-        snapshot_name = snap.get("name")
-        created_str = snap.get("created_at")
-        if not created_str:
-            logger.warning(f"No creation date for snapshot '{snapshot_name}' in {vm_name}; skipping.")
-            continue
-        try:
-            created_at = parse_iso_datetime(created_str)
-        except Exception as e:
-            logger.error(f"Error parsing creation date for snapshot '{snapshot_name}' in {vm_name}: {e}")
-            continue
+    """Prunes snapshots for a given VM that are older than retention_days."""
+    logger.info(f"Starting snapshot pruning for {vm_name}")
+    
+    try:
+        # Get snapshot list in JSON format
+        result = run_command(["incus", "snapshot", "list", vm_name, "--format", "json"],
+                            description=f"listing snapshots for {vm_name}")
+        snapshots = json.loads(result.stdout)
+    except Exception as e:
+        logger.error(f"Failed to get snapshots for {vm_name}: {e}")
+        return
 
     cutoff = datetime.utcnow() - timedelta(days=retention_days)
-    logger.debug(f"Snapshot cutoff datetime (UTC) for {vm_name}: {cutoff.isoformat()}")
+    logger.debug(f"Snapshot cutoff time (UTC): {cutoff.isoformat()}")
 
     for snap in snapshots:
-        snapshot_name = snap.get("name")
-        created_str = snap.get("created_at")
-        if not created_str:
-            logger.warning(f"No creation date for snapshot '{snapshot_name}' in {vm_name}; skipping.")
-            continue
         try:
-            created_at = datetime.strptime(created_str, "%Y-%m-%dT%H:%M:%SZ")
-        except Exception as e:
-            logger.error(f"Error parsing creation date for snapshot '{snapshot_name}' in {vm_name}: {e}")
-            continue
+            snapshot_name = snap["name"]
+            created_str = snap["created_at"]
+            
+            # Parse ISO 8601 timestamp with fractional seconds
+            created_at = parse_iso_datetime(created_str)
 
-        if created_at < cutoff:
-            logger.info(f"Pruning snapshot '{snapshot_name}' of VM '{vm_name}' (created at {created_at.isoformat()} UTC)")
-            try:
+            if created_at < cutoff:
+                logger.info(f"Deleting snapshot {snapshot_name} (created {created_at.isoformat()} UTC)")
                 run_command(["incus", "snapshot", "delete", vm_name, snapshot_name],
-                            description=f"deleting snapshot {snapshot_name} for {vm_name}")
-            except Exception as e:
-                logger.error(f"Error deleting snapshot '{snapshot_name}' for {vm_name}: {e}")
+                           description=f"delete snapshot {snapshot_name}")
+            else:
+                logger.debug(f"Keeping recent snapshot {snapshot_name} (created {created_at.isoformat()} UTC)")
+
+        except KeyError as e:
+            logger.error(f"Missing field in snapshot data: {e}")
+        except ValueError as e:
+            logger.error(f"Failed to parse timestamp {created_str}: {e}")
+        except Exception as e:
+            logger.error(f"Error processing snapshot: {e}")
 
 def snapshot_vm(vm_name, snapshot_name):
     """
-    Creates a snapshot of the specified VM using the 'incus snapshot create' command.
+    Creates a snapshot of the specified VM using 'incus snapshot create'.
+    Uses --stateful flag when STATEFUL_SNAPSHOTS is True to preserve running state.
     """
-    logger.info(f"Taking snapshot for VM '{vm_name}' with snapshot name '{snapshot_name}'")
+    logger.info(f"Taking {'stateful ' if STATEFUL_SNAPSHOTS else ''}snapshot for VM '{vm_name}'")
+    
+    cmd = ["incus", "snapshot", "create"]
+    if STATEFUL_SNAPSHOTS:
+        cmd.append("--stateful")
+    
+    cmd += [vm_name, snapshot_name]
+
     try:
-        run_command(["incus", "snapshot", "create", vm_name, snapshot_name],
-                    description=f"creating snapshot for {vm_name}")
+        run_command(cmd, description=f"creating {'stateful ' if STATEFUL_SNAPSHOTS else ''}snapshot")
+        logger.debug(f"Snapshot {snapshot_name} created successfully")
+    except subprocess.CalledProcessError as e:
+        if STATEFUL_SNAPSHOTS:
+            logger.warning("Stateful snapshot failed, attempting stateless...")
+            try:
+                run_command(["incus", "snapshot", "create", vm_name, snapshot_name],
+                           description="fallback stateless snapshot")
+            except Exception as fallback_e:
+                logger.error(f"Failed both stateful and stateless snapshots: {fallback_e}")
+                raise
+        else:
+            logger.error(f"Snapshot creation failed: {e}")
+            raise
     except Exception as e:
-        logger.error(f"Error taking snapshot for {vm_name}: {e}")
+        logger.error(f"Unexpected error during snapshot: {e}")
         raise
 
 def export_vm(vm_name, backup_path):
@@ -180,6 +203,42 @@ def export_vm(vm_name, backup_path):
         logger.error(f"Error exporting VM {vm_name}: {e}")
         raise
 
+def prune_old_backups():
+    """Removes backup files older than BACKUP_RETENTION_DAYS days"""
+    logger.info(f"Pruning backups older than {BACKUP_RETENTION_DAYS} days")
+    
+    cutoff = datetime.now() - timedelta(days=BACKUP_RETENTION_DAYS)
+    deleted_count = 0
+    error_count = 0
+
+    try:
+        for filename in os.listdir(BACKUP_DIR):
+            if not filename.endswith(".tar.gz"):
+                continue
+                
+            try:
+                # Extract timestamp from filename format: vmname-YYYYMMDDHHMMSS.tar.gz
+                timestamp_str = filename.split("-")[-1].split(".")[0]
+                file_date = datetime.strptime(timestamp_str, "%Y%m%d%H%M%S")
+                file_path = os.path.join(BACKUP_DIR, filename)
+                
+                if file_date < cutoff:
+                    logger.debug(f"Deleting old backup: {filename}")
+                    os.remove(file_path)
+                    deleted_count += 1
+                    
+            except ValueError as e:
+                error_count += 1
+                logger.error(f"Invalid timestamp in filename {filename}: {e}")
+            except Exception as e:
+                error_count += 1
+                logger.error(f"Error deleting {filename}: {e}")
+
+        logger.info(f"Backup pruning complete. Deleted {deleted_count} files, {error_count} errors")
+
+    except Exception as e:
+        logger.error(f"Failed to prune backups: {e}")
+
 def main():
     logger.info("Starting backup process for Incus VMs.")
 
@@ -196,6 +255,8 @@ def main():
 
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     logger.debug(f"Timestamp for backup: {timestamp}")
+    
+    # Process all VMs first
     for vm in vm_names:
         logger.info(f"Processing VM: {vm}")
         try:
@@ -210,6 +271,8 @@ def main():
             export_vm(vm, backup_file)
         except Exception as e:
             logger.error(f"Skipping export for {vm} due to error: {e}")
+    # Prune old backups after processing all VMs
+    prune_old_backups()
 
 if __name__ == "__main__":
     main()
