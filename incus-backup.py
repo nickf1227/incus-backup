@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 # ==========================
 # Configuration Variables
 # ==========================
-DEBUG = True                               # Enable/disable debug output.
+DEBUG = False                               # Enable/disable debug output.
 RETENTION_DAYS = 7                         # Days to retain snapshots
 BACKUP_RETENTION_DAYS = 14                 # Days to retain backup files
 BACKUP_DIR = "/mnt/ice/incus-vms/"         # Directory for exported backups
