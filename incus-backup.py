@@ -5,16 +5,17 @@ import os
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 # ==========================
 # Configuration Variables
 # ==========================
 DEBUG = False                               # Enable/disable debug output.
-RETENTION_DAYS = 7                         # Days to retain snapshots
 BACKUP_RETENTION_DAYS = 14                 # Days to retain backup files
 BACKUP_DIR = "/mnt/ice/incus-vms/"         # Directory for exported backups
 LOG_FILE = "/var/log/incus-backup-nickf.log" # Log file path
-STATEFUL_SNAPSHOTS = False                  # Create snapshots with running state, including process memory state, TCP connections, etc
+STORAGE_POOL = "default"                   # Name of the Incus storage pool
+PROJECT = "default"                        # Incus project name
 # ==========================
 
 # Set up logging
@@ -88,88 +89,30 @@ def get_vm_names():
     logger.debug(f"Total VMs found: {vm_list}")
     return vm_list
 
-def parse_iso_datetime(datetime_str):
-    """Parse ISO 8601 datetime strings with optional fractional seconds, adjusting to 6 digits if needed."""
-    if '.' in datetime_str and datetime_str.endswith('Z'):
-        date_part, frac_part = datetime_str.split('.', 1)
-        frac_part = frac_part.rstrip('Z')
-        # Truncate or pad fractional part to 6 digits
-        frac_adjusted = frac_part[:6].ljust(6, '0')  # Truncate to 6 digits, pad with zeros if shorter
-        adjusted_str = f"{date_part}.{frac_adjusted}Z"
-        return datetime.strptime(adjusted_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-    else:
-        # Handle case without fractional seconds
-        return datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%SZ")
-
-def prune_old_snapshots(vm_name, retention_days):
-    """Prunes snapshots for a given VM that are older than retention_days."""
-    logger.info(f"Starting snapshot pruning for {vm_name}")
-    
+def get_vm_block_volumes(storage_pool, project="default"):
+    """Returns a dictionary mapping VM names to their custom block volumes in the specified project."""
     try:
-        # Get snapshot list in JSON format
-        result = run_command(["incus", "snapshot", "list", vm_name, "--format", "json"],
-                            description=f"listing snapshots for {vm_name}")
-        snapshots = json.loads(result.stdout)
+        result = run_command(
+            ["incus", "storage", "volume", "list", storage_pool, "--all-projects", "--format", "json"],
+            description=f"listing storage volumes in pool {storage_pool}"
+        )
+        volumes = json.loads(result.stdout)
     except Exception as e:
-        logger.error(f"Failed to get snapshots for {vm_name}: {e}")
-        return
+        logger.error(f"Failed to get storage volumes: {e}")
+        return defaultdict(list)
 
-    cutoff = datetime.utcnow() - timedelta(days=retention_days)
-    logger.debug(f"Snapshot cutoff time (UTC): {cutoff.isoformat()}")
-
-    for snap in snapshots:
-        try:
-            snapshot_name = snap["name"]
-            created_str = snap["created_at"]
-            
-            # Parse ISO 8601 timestamp with fractional seconds
-            created_at = parse_iso_datetime(created_str)
-
-            if created_at < cutoff:
-                logger.info(f"Deleting snapshot {snapshot_name} (created {created_at.isoformat()} UTC)")
-                run_command(["incus", "snapshot", "delete", vm_name, snapshot_name],
-                           description=f"delete snapshot {snapshot_name}")
-            else:
-                logger.debug(f"Keeping recent snapshot {snapshot_name} (created {created_at.isoformat()} UTC)")
-
-        except KeyError as e:
-            logger.error(f"Missing field in snapshot data: {e}")
-        except ValueError as e:
-            logger.error(f"Failed to parse timestamp {created_str}: {e}")
-        except Exception as e:
-            logger.error(f"Error processing snapshot: {e}")
-
-def snapshot_vm(vm_name, snapshot_name):
-    """
-    Creates a snapshot of the specified VM using 'incus snapshot create'.
-    Uses --stateful flag when STATEFUL_SNAPSHOTS is True to preserve running state.
-    """
-    logger.info(f"Taking {'stateful ' if STATEFUL_SNAPSHOTS else ''}snapshot for VM '{vm_name}'")
-    
-    cmd = ["incus", "snapshot", "create"]
-    if STATEFUL_SNAPSHOTS:
-        cmd.append("--stateful")
-    
-    cmd += [vm_name, snapshot_name]
-
-    try:
-        run_command(cmd, description=f"creating {'stateful ' if STATEFUL_SNAPSHOTS else ''}snapshot")
-        logger.debug(f"Snapshot {snapshot_name} created successfully")
-    except subprocess.CalledProcessError as e:
-        if STATEFUL_SNAPSHOTS:
-            logger.warning("Stateful snapshot failed, attempting stateless...")
-            try:
-                run_command(["incus", "snapshot", "create", vm_name, snapshot_name],
-                           description="fallback stateless snapshot")
-            except Exception as fallback_e:
-                logger.error(f"Failed both stateful and stateless snapshots: {fallback_e}")
-                raise
-        else:
-            logger.error(f"Snapshot creation failed: {e}")
-            raise
-    except Exception as e:
-        logger.error(f"Unexpected error during snapshot: {e}")
-        raise
+    vm_volumes = defaultdict(list)
+    for vol in volumes:
+        if (
+            vol.get("project") == project
+            and vol.get("type") == "custom"
+            and vol.get("content_type") == "block"
+        ):
+            for used_by in vol.get("used_by", []):
+                if used_by.startswith("/1.0/instances/"):
+                    vm_name = used_by.split("/")[-1]
+                    vm_volumes[vm_name].append(vol["name"])
+    return vm_volumes
 
 def export_vm(vm_name, backup_path):
     """
@@ -178,18 +121,16 @@ def export_vm(vm_name, backup_path):
     logger.info(f"Exporting VM '{vm_name}' to file '{backup_path}'")
     try:
         start_time = datetime.now()
-        run_command(["incus", "export", vm_name, backup_path],
+        run_command(["incus", "export", vm_name, backup_path, "--instance-only"],
                     description=f"exporting VM {vm_name} to {backup_path}")
         end_time = datetime.now()
         
-        # Calculate duration
         duration = end_time - start_time
         duration_sec = duration.total_seconds()
         
-        # Get backup size and calculate speed
         if os.path.exists(backup_path):
             size_bytes = os.path.getsize(backup_path)
-            size_mb = size_bytes / (1024 * 1024)  # Convert to MB
+            size_mb = size_bytes / (1024 * 1024)
             speed = size_mb / duration_sec if duration_sec > 0 else float('inf')
             
             logger.info(
@@ -201,6 +142,41 @@ def export_vm(vm_name, backup_path):
             
     except Exception as e:
         logger.error(f"Error exporting VM {vm_name}: {e}")
+        raise
+
+def export_block_volume(storage_pool, volume_name, backup_path, project):
+    """
+    Exports a block storage volume to a file using incus storage volume export.
+    """
+    logger.info(f"Exporting block volume '{volume_name}' to '{backup_path}'")
+    try:
+        start_time = datetime.now()
+        cmd = [
+            "incus", "storage", "volume", "export",
+            storage_pool,
+            volume_name,
+            backup_path,
+            "--project", project
+        ]
+        run_command(cmd, description=f"exporting block volume {volume_name}")
+        end_time = datetime.now()
+        
+        duration = end_time - start_time
+        duration_sec = duration.total_seconds()
+        
+        if os.path.exists(backup_path):
+            size_bytes = os.path.getsize(backup_path)
+            size_mb = size_bytes / (1024 * 1024)
+            speed = size_mb / duration_sec if duration_sec > 0 else float('inf')
+            
+            logger.info(
+                f"Block volume {volume_name} exported in {duration_sec:.2f} seconds. "
+                f"Size: {size_mb:.2f} MB. Speed: {speed:.2f} MB/s"
+            )
+        else:
+            logger.error(f"Block volume backup {backup_path} not found after export")
+    except Exception as e:
+        logger.error(f"Error exporting block volume {volume_name}: {e}")
         raise
 
 def prune_old_backups():
@@ -217,7 +193,6 @@ def prune_old_backups():
                 continue
                 
             try:
-                # Extract timestamp from filename format: vmname-YYYYMMDDHHMMSS.tar.gz
                 timestamp_str = filename.split("-")[-1].split(".")[0]
                 file_date = datetime.strptime(timestamp_str, "%Y%m%d%H%M%S")
                 file_path = os.path.join(BACKUP_DIR, filename)
@@ -241,38 +216,35 @@ def prune_old_backups():
 
 def main():
     logger.info("Starting backup process for Incus VMs.")
-
+    
     try:
         check_backup_dir(BACKUP_DIR)
-    except RuntimeError as e:
-        logger.error(e)
-        return
-
-    vm_names = get_vm_names()
-    if not vm_names:
-        logger.error("No VMs found or error retrieving instance list.")
-        return
-
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    logger.debug(f"Timestamp for backup: {timestamp}")
-    
-    # Process all VMs first
-    for vm in vm_names:
-        logger.info(f"Processing VM: {vm}")
-        try:
-            prune_old_snapshots(vm, RETENTION_DAYS)
-        except Exception as e:
-            logger.error(f"Error during snapshot pruning for {vm}: {e}")
-
-        snapshot_name = f"snapshot-{timestamp}"
-        backup_file = f"{BACKUP_DIR.rstrip('/')}/{vm}-{timestamp}.tar.gz"
-        try:
-            snapshot_vm(vm, snapshot_name)
-            export_vm(vm, backup_file)
-        except Exception as e:
-            logger.error(f"Skipping export for {vm} due to error: {e}")
-    # Prune old backups after processing all VMs
-    prune_old_backups()
+        vm_names = get_vm_names()
+        vm_block_volumes = get_vm_block_volumes(STORAGE_POOL, PROJECT)
+        
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        
+        for vm in vm_names:
+            logger.info(f"Processing VM: {vm}")
+            try:
+                # Export VM
+                vm_backup_path = f"{BACKUP_DIR.rstrip('/')}/{vm}-{timestamp}.tar.gz"
+                export_vm(vm, vm_backup_path)
+                
+                # Export associated block volumes
+                if vm in vm_block_volumes:
+                    for volume_name in vm_block_volumes[vm]:
+                        block_backup_path = f"{BACKUP_DIR.rstrip('/')}/{vm}-block-{volume_name}-{timestamp}.tar.gz"
+                        export_block_volume(STORAGE_POOL, volume_name, block_backup_path, PROJECT)
+                else:
+                    logger.debug(f"No block volumes found for VM {vm}")
+            except Exception as e:
+                logger.error(f"Skipping {vm} due to error: {e}")
+        
+        prune_old_backups()
+        
+    except Exception as e:
+        logger.error(f"Fatal error in main process: {e}")
 
 if __name__ == "__main__":
     main()
