@@ -114,37 +114,53 @@ def get_vm_block_volumes(storage_pool, project="default"):
                     vm_volumes[vm_name].append(vol["name"])
     return vm_volumes
 
-def export_vm(vm_name, backup_path):
+def format_duration(duration: timedelta) -> str:
+    """
+    Format a timedelta into a human-readable string: seconds, minutes, or hours.
+    """
+    total_seconds = duration.total_seconds()
+    if total_seconds < 60:
+        return f"{total_seconds:.2f} seconds"
+    elif total_seconds < 3600:
+        minutes = total_seconds / 60
+        return f"{minutes:.2f} minutes"
+    else:
+        hours = total_seconds / 3600
+        return f"{hours:.2f} hours"
+
+
+def export_vm(vm_name: str, backup_path: str) -> None:
     """
     Exports the VM to a file using the incus export command and calculates metrics.
     """
     logger.info(f"Exporting VM '{vm_name}' to file '{backup_path}'")
     try:
         start_time = datetime.now()
-        run_command(["incus", "export", vm_name, backup_path, "--optimized-storage", "--instance-only"],
-                    description=f"exporting VM {vm_name} to {backup_path}")
+        run_command(
+            ["incus", "export", vm_name, backup_path, "--optimized-storage", "--instance-only"],
+            description=f"exporting VM {vm_name} to {backup_path}"
+        )
         end_time = datetime.now()
-        
         duration = end_time - start_time
-        duration_sec = duration.total_seconds()
-        
+
         if os.path.exists(backup_path):
             size_bytes = os.path.getsize(backup_path)
             size_mb = size_bytes / (1024 * 1024)
-            speed = size_mb / duration_sec if duration_sec > 0 else float('inf')
-            
+            duration_str = format_duration(duration)
+            speed = size_mb / duration.total_seconds() if duration.total_seconds() > 0 else float('inf')
+
             logger.info(
-                f"Backup of {vm_name} completed in {duration_sec:.2f} seconds. "
+                f"Backup of {vm_name} completed in {duration_str}. "
                 f"Size: {size_mb:.2f} MB. Speed: {speed:.2f} MB/s"
             )
         else:
             logger.error(f"Backup file {backup_path} not found after export")
-            
     except Exception as e:
         logger.error(f"Error exporting VM {vm_name}: {e}")
         raise
 
-def export_block_volume(storage_pool, volume_name, backup_path, project):
+
+def export_block_volume(storage_pool: str, volume_name: str, backup_path: str, project: str = None) -> None:
     """
     Exports a block storage volume to a file using incus storage volume export.
     """
@@ -158,19 +174,20 @@ def export_block_volume(storage_pool, volume_name, backup_path, project):
             backup_path,
             "--optimized-storage"
         ]
+        if project:
+            cmd.extend(["--project", project])
         run_command(cmd, description=f"exporting block volume {volume_name}")
         end_time = datetime.now()
-        
         duration = end_time - start_time
-        duration_sec = duration.total_seconds()
-        
+
         if os.path.exists(backup_path):
             size_bytes = os.path.getsize(backup_path)
             size_mb = size_bytes / (1024 * 1024)
-            speed = size_mb / duration_sec if duration_sec > 0 else float('inf')
-            
+            duration_str = format_duration(duration)
+            speed = size_mb / duration.total_seconds() if duration.total_seconds() > 0 else float('inf')
+
             logger.info(
-                f"Block volume {volume_name} exported in {duration_sec:.2f} seconds. "
+                f"Block volume {volume_name} exported in {duration_str}. "
                 f"Size: {size_mb:.2f} MB. Speed: {speed:.2f} MB/s"
             )
         else:
@@ -178,6 +195,7 @@ def export_block_volume(storage_pool, volume_name, backup_path, project):
     except Exception as e:
         logger.error(f"Error exporting block volume {volume_name}: {e}")
         raise
+
 def prune_old_backups():
     """Removes backup files older than BACKUP_RETENTION_DAYS days"""
     logger.info(f"Pruning backups older than {BACKUP_RETENTION_DAYS} days")
