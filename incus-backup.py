@@ -121,7 +121,7 @@ def export_vm(vm_name, backup_path):
     logger.info(f"Exporting VM '{vm_name}' to file '{backup_path}'")
     try:
         start_time = datetime.now()
-        run_command(["incus", "export", vm_name, backup_path, "--instance-only"],
+        run_command(["incus", "export", vm_name, backup_path, "--optimized-storage", "--instance-only"],
                     description=f"exporting VM {vm_name} to {backup_path}")
         end_time = datetime.now()
         
@@ -156,7 +156,7 @@ def export_block_volume(storage_pool, volume_name, backup_path, project):
             storage_pool,
             volume_name,
             backup_path,
-            "--project", project
+            "--optimized-storage"
         ]
         run_command(cmd, description=f"exporting block volume {volume_name}")
         end_time = datetime.now()
@@ -178,7 +178,6 @@ def export_block_volume(storage_pool, volume_name, backup_path, project):
     except Exception as e:
         logger.error(f"Error exporting block volume {volume_name}: {e}")
         raise
-
 def prune_old_backups():
     """Removes backup files older than BACKUP_RETENTION_DAYS days"""
     logger.info(f"Pruning backups older than {BACKUP_RETENTION_DAYS} days")
